@@ -169,10 +169,26 @@
      * ========================================================= */
     const ActivationController = (() => {
 
-        const matchPattern = (pattern) =>
-            pattern instanceof RegExp
-                ? pattern.test(location.href)
-                : location.href.startsWith(pattern);
+    const matchPattern = (pattern) => {
+        const url = new URL(location.href);
+    
+        if (pattern instanceof RegExp) {
+            return pattern.test(location.href);
+        }
+    
+        if (typeof pattern !== "string") {
+            return false;
+        }
+    
+        if (/^https?:\/\//i.test(pattern)) {
+            return location.href.startsWith(pattern);
+        }
+    
+        const host = pattern.toLowerCase().replace(/^\*\./, '');
+        const hostname = url.hostname.toLowerCase();
+    
+        return hostname === host || hostname.endsWith(`.${host}`);
+    };
 
         function passesWhitelist() {
             return CONFIG.urlWhitelist.length === 0 ||
