@@ -18,7 +18,15 @@
     const CONFIG = {
         enabled: true,
 
-        urlWhitelist: [],        // [] = semua situs. Contoh: [/^https:\/\/app\.contoh\.com/]
+        urlWhitelist: [
+            "kahoot.com",
+            "kahoot.it",
+            "quizlet.com",
+            "quizizz.com",
+            "wayground.com",
+            "blooket.com",
+            "gimkit.com"
+        ],                   // [] = semua situs. Contoh: [/^https:\/\/app\.contoh\.com/]
         urlBlacklist: [],
         requireQueryParam: null, // contoh: 'automation' → hanya aktif jika ?automation=1
         requireSelector: null,   // contoh: 'form#login'   → hanya aktif jika elemen ada
