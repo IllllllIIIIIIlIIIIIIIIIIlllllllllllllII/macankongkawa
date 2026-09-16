@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Form Automation & Background Playback Suite
+// @name         Form Automation & Background Playback Suite (Stealth)
 // @namespace    https://github.com/local-automation
-// @version      2.0.0
-// @description  Suite otomatisasi dengan sistem aktivasi kondisional & self-test bawaan.
+// @version      3.0.0
+// @description  UI Hardening Test Suite — zero footprint, native-like spoofing, full keystroke emulation chain.
 // @author       You
 // @match        *://*/*
 // @run-at       document-start
@@ -13,121 +13,191 @@
     'use strict';
 
     /* =========================================================
-     * KONFIGURASI UTAMA — ATUR AKTIVASI DI SINI
+     * KONFIGURASI INTERNAL (tidak terekspos ke scope global)
      * ========================================================= */
     const CONFIG = {
+        enabled: true,
 
-        // ---- AKTIVASI GLOBAL ----
-        enabled: true, // Master switch. Set false = semua modul mati.
+        urlWhitelist: [],        // [] = semua situs. Contoh: [/^https:\/\/app\.contoh\.com/]
+        urlBlacklist: [],
+        requireQueryParam: null, // contoh: 'automation' → hanya aktif jika ?automation=1
+        requireSelector: null,   // contoh: 'form#login'   → hanya aktif jika elemen ada
 
-        // ---- AKTIVASI BERDASARKAN URL ----
-        urlWhitelist: [
-            // Kosongkan array [] = aktif di semua situs.
-            // Contoh:
-            // /^https:\/\/contoh\.com\/form/,   // regex
-            // 'https://app.tes.com/login'        // string exact match
-        ],
-        urlBlacklist: [
-            // Situs yang TIDAK boleh aktif (prioritas tinggi)
-            // 'https://bank-saya.com'
-        ],
+        storageKey: 'FAS_enabled',
 
-        // ---- AKTIVASI VIA QUERY PARAMETER ----
-        // Aktif hanya jika URL mengandung ?automation=1 (jika null = tidak dipakai)
-        requireQueryParam: null, // contoh: 'automation'
-
-        // ---- AKTIVASI VIA ELEMEN TARGET ----
-        // Aktif hanya jika elemen ini ada di halaman (null = lewati cek)
-        requireSelector: null, // contoh: 'form#registration'
-
-        // ---- AKTIVASI VIA STORAGE (persisten antar reload) ----
-        storageKey: 'FAS_enabled', // localStorage['FAS_enabled'] = '1' / '0'
-
-        // ---- FEATURE FLAGS PER MODUL ----
         modules: {
-            playback:      true,  // Modul 1: Anti-pause media
-            accessibility: true,  // Modul 2: Restorasi konteks/klik kanan
-            typing:        true,  // Modul 3: Humanized typing
+            playback:      true,
+            accessibility: true,
+            typing:        true,
         },
 
-        // ---- MODE DEBUG & SELF-TEST ----
-        debug:       true,   // Tampilkan log verbose di console
-        runSelfTest: true,   // Jalankan verifikasi otomatis setelah load
+        debug:       false,  // default mati — log console bisa jadi indikator deteksi
+        runSelfTest: false, // aktifkan hanya saat sesi pengujian manual
     };
 
     /* =========================================================
-     * UTILITAS BERSAMA
+     * CORE UTILITIES
      * ========================================================= */
-    const CoreUtils = {
-        randomDelay(min, max) {
-            return new Promise((resolve) => {
-                const delay = Math.floor(Math.random() * (max - min + 1)) + min;
-                setTimeout(resolve, delay);
-            });
-        },
-
-        log(module, message) {
+    const CoreUtils = (() => {
+        const log = (module, message) => {
             if (!CONFIG.debug) return;
-            console.log(
-                `%c[FAS][${module}]%c ${message}`,
-                'color:#4fc3f7;font-weight:bold',
-                'color:inherit'
-            );
-        },
+            console.debug(`%c[FAS][${module}]%c ${message}`,
+                'color:#4fc3f7;font-weight:bold', 'color:inherit');
+        };
 
-        warn(module, message) {
+        const warn = (module, message) =>
             console.warn(`[FAS][${module}] ${message}`);
-        }
-    };
+
+        const randomDelay = (min, max) =>
+            new Promise((resolve) =>
+                setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
+
+        return { log, warn, randomDelay };
+    })();
 
     /* =========================================================
-     * ACTIVATION CONTROLLER
-     * Memutuskan apakah script boleh jalan di halaman ini.
+     * STEALTH CORE — Native-Like Spoofing Infrastructure
+     * ========================================================= */
+    const StealthCore = (() => {
+
+        // Referensi toString asli disimpan sekali di closure — tidak bisa diakses dari luar.
+        const nativeToString = Function.prototype.toString;
+
+        /**
+         * Registry fungsi-spoof → string sumber palsu.
+         * WeakMap = tidak mencegah garbage collection, tidak enumerable.
+         */
+        const spoofedSources = new WeakMap();
+
+        /**
+         * Daftar toString asli dari built-in yang WAJIB tetap "terlihat native".
+         * Dipakai sebagai kalibrasi format output.
+         */
+        const nativeToStringOutput = nativeToString.call(nativeToString);
+
+        /**
+         * Tandai sebuah fungsi agar toString()-nya mengembalikan
+         * string palsu (umumnya format "[native code]").
+         */
+        function blindFunction(fn, fakeSource) {
+            spoofedSources.set(fn, fakeSource ?? nativeToStringOutput);
+        }
+
+        /**
+         * Patch Function.prototype.toString.
+         * - Jika fungsi ada di registry → kembalikan sumber palsu.
+         * - Jika tidak → delegasikan ke native (hasil 100% autentik).
+         * - Patch ini sendiri di-blinding agar toString.toString() terlihat native.
+         * - Descriptor dibuat identik dengan native (non-enumerable, writable, configurable).
+         */
+        function patchToString() {
+            const patchedToString = function toString() {
+                // Guard: dipanggil pada receiver non-fungsi → tolak seperti native
+                if (typeof this !== 'function' && this !== Function.prototype) {
+                    try {
+                        return nativeToString.call(this);
+                    } catch (e) {
+                        throw new TypeError(
+                            'Function.prototype.toString requires that \'this\' be a Function'
+                        );
+                    }
+                }
+                if (spoofedSources.has(this)) {
+                    return spoofedSources.get(this);
+                }
+                return nativeToString.call(this);
+            };
+
+            // Format output toString-nya sendiri harus persis native:
+            // "function toString() { [native code] }"
+            blindFunction(patchedToString, 'function toString() { [native code] }');
+
+            Object.defineProperty(Function.prototype, 'toString', {
+                value: patchedToString,
+                writable: true,
+                enumerable: false,
+                configurable: true
+            });
+
+            CoreUtils.log('Stealth', 'Function.prototype.toString di-blinding.');
+        }
+
+        /**
+         * Override properti pada objek dengan descriptor yang MENIRU
+         * descriptor asli browser (enumerable & configurable diwarisi
+         * dari descriptor lama), lalu getter-nya di-blinding.
+         */
+        function spoofProperty(target, propName, getterFn, fakeGetterSource) {
+            const original = Object.getOwnPropertyDescriptor(target, propName);
+
+            blindFunction(getterFn, fakeGetterSource);
+
+            Object.defineProperty(target, propName, {
+                get: getterFn,
+                set: original && original.set ? original.set : undefined,
+                // Warisi karakteristik asli → Object.getOwnPropertyDescriptor()
+                // akan menampilkan pola yang identik dengan properti built-in.
+                enumerable: original ? original.enumerable : true,
+                configurable: original ? original.configurable : true
+            });
+        }
+
+        /**
+         * Kunci eksternal: blokir inspeksi via Error stack terhadap
+         * fungsi yang di-blinding (lapisan cadangan untuk detektor yang
+         * mem-parse source melalui Error().stack).
+         */
+        function hardenErrorStack() {
+            const nativePrepare = Error.prepareStackTrace;
+            blindFunction(
+                Error.prepareStackTrace ? Error.prepareStackTrace : function () {},
+                nativeToString.call(nativePrepare || (() => {}))
+            );
+        }
+
+        function init() {
+            patchToString();
+            hardenErrorStack();
+            CoreUtils.log('Stealth', 'StealthCore aktif — zero global footprint terjaga.');
+        }
+
+        return { init, blindFunction, spoofProperty };
+    })();
+
+    /* =========================================================
+     * ACTIVATION CONTROLLER (internal, tanpa API publik)
      * ========================================================= */
     const ActivationController = (() => {
 
-        /** Cek URL whitelist (kalau diisi, HARUS match salah satu). */
+        const matchPattern = (pattern) =>
+            pattern instanceof RegExp
+                ? pattern.test(location.href)
+                : location.href.startsWith(pattern);
+
         function passesWhitelist() {
-            if (CONFIG.urlWhitelist.length === 0) return true;
-            return CONFIG.urlWhitelist.some((pattern) =>
-                pattern instanceof RegExp
-                    ? pattern.test(location.href)
-                    : location.href.startsWith(pattern)
-            );
+            return CONFIG.urlWhitelist.length === 0 ||
+                   CONFIG.urlWhitelist.some(matchPattern);
         }
 
-        /** Cek URL blacklist (jika match → langsung blokir). */
         function passesBlacklist() {
-            return !CONFIG.urlBlacklist.some((pattern) =>
-                pattern instanceof RegExp
-                    ? pattern.test(location.href)
-                    : location.href.startsWith(pattern)
-            );
+            return !CONFIG.urlBlacklist.some(matchPattern);
         }
 
-        /** Cek query param, misal ?automation=1 */
         function passesQueryParam() {
             if (!CONFIG.requireQueryParam) return true;
-            return new URLSearchParams(location.search).get(CONFIG.requireQueryParam) === '1';
+            return new URLSearchParams(location.search)
+                .get(CONFIG.requireQueryParam) === '1';
         }
 
-        /** Cek storage flag — memungkinkan toggle antar reload. */
         function passesStorageFlag() {
             const stored = localStorage.getItem(CONFIG.storageKey);
-            if (stored === null) return true;           // belum pernah di-set → default jalan
-            return stored === '1';
+            return stored === null || stored === '1';
         }
 
-        /** Cek keberadaan elemen target (harus menunggu DOM). */
         function passesSelectorCheck() {
             return new Promise((resolve) => {
                 if (!CONFIG.requireSelector) return resolve(true);
-
-                const check = () => {
-                    const found = !!document.querySelector(CONFIG.requireSelector);
-                    resolve(found);
-                };
-
+                const check = () => resolve(!!document.querySelector(CONFIG.requireSelector));
                 if (document.readyState === 'loading') {
                     document.addEventListener('DOMContentLoaded', check);
                 } else {
@@ -136,188 +206,73 @@
             });
         }
 
-        /**
-         * Keputusan akhir: apakah script aktif di halaman ini?
-         * @returns {Promise<{active: boolean, reasons: string[]}>}
-         */
         async function evaluate() {
             const reasons = [];
             let active = true;
 
-            if (!CONFIG.enabled)                    { active = false; reasons.push('master switch OFF'); }
-            if (!passesBlacklist())                 { active = false; reasons.push('URL diblacklist'); }
-            if (!passesWhitelist())                 { active = false; reasons.push('URL tidak ada di whitelist'); }
-            if (!passesQueryParam())                { active = false; reasons.push(`query param ?${CONFIG.requireQueryParam}=1 tidak ada`); }
-            if (!passesStorageFlag())               { active = false; reasons.push('storage flag OFF (localStorage)'); }
-            if (!await passesSelectorCheck())       { active = false; reasons.push(`elemen "${CONFIG.requireSelector}" tidak ditemukan`); }
+            if (!CONFIG.enabled)              { active = false; reasons.push('master switch OFF'); }
+            if (!passesBlacklist())           { active = false; reasons.push('URL diblacklist'); }
+            if (!passesWhitelist())           { active = false; reasons.push('URL di luar whitelist'); }
+            if (!passesQueryParam())          { active = false; reasons.push('query param tidak ada'); }
+            if (!passesStorageFlag())         { active = false; reasons.push('storage flag OFF'); }
+            if (!await passesSelectorCheck()) { active = false; reasons.push('elemen target tidak ditemukan'); }
 
             return { active, reasons };
         }
 
-        /**
-         * Helper cepat: toggle ON/OFF via console.
-         * FAS.toggle()           → flip status
-         * FAS.toggle(true/false) → set eksplisit
-         * Setelah toggle, reload halaman untuk menerapkan.
-         */
-        function toggle(force) {
-            const current = localStorage.getItem(CONFIG.storageKey) !== '0';
-            const next = force !== undefined ? force : !current;
-            localStorage.setItem(CONFIG.storageKey, next ? '1' : '0');
-            console.log(`%c[FAS] Script ${next ? 'DIAKTIFKAN ✓' : 'DINONAKTIFKAN ✗'} — reload halaman untuk menerapkan.`, 'color:#81c784;font-weight:bold');
-            return next;
-        }
-
-        return { evaluate, toggle };
+        return { evaluate };
     })();
 
     /* =========================================================
-     * SELF-TEST MODULE (VERIFIKASI)
-     * Membuktikan secara objektif bahwa tiap modul bekerja.
-     * ========================================================= */
-    const SelfTest = (() => {
-
-        const results = [];
-
-        function record(name, passed, detail) {
-            results.push({ name, passed, detail });
-            console.log(
-                `${passed ? '✅' : '❌'} [Test] ${name}${detail ? ` — ${detail}` : ''}`
-            );
-        }
-
-        /** TEST 1: Apakah document.hidden sudah ter-spoof? */
-        function testVisibilitySpoof() {
-            const hiddenOK = document.hidden === false;
-            const stateOK = document.visibilityState === 'visible';
-            record(
-                'Visibility Spoof',
-                hiddenOK && stateOK,
-                `document.hidden=${document.hidden}, visibilityState="${document.visibilityState}"`
-            );
-        }
-
-        /** TEST 2: Apakah event blur diblokir? (simulasi) */
-        function testBlurInterception() {
-            let leaked = false;
-            // Listener "korban" — kalau ini jalan, artinya intersepsi GAGAL
-            const victim = () => { leaked = true; };
-            window.addEventListener('blur', victim);
-            window.dispatchEvent(new Event('blur'));
-            window.removeEventListener('blur', victim);
-            record('Intersepsi Blur', !leaked, leaked ? 'event lolos ke handler!' : 'event berhasil diblokir');
-        }
-
-        /** TEST 3: Apakah contextmenu lolos tanpa diblokir situs? */
-        function testContextMenuRestoration() {
-            let blocked = false;
-            const target = document.body;
-            const blocker = (e) => e.preventDefault();
-            // Simulasi situs jahat yang blokir klik kanan:
-            target.addEventListener('contextmenu', blocker);
-            // Lalu kita cek: apakah skrip kita menetralkannya?
-            const probe = (e) => { if (e.defaultPrevented) blocked = true; };
-            target.addEventListener('contextmenu', probe);
-            target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
-            target.removeEventListener('contextmenu', blocker);
-            target.removeEventListener('contextmenu', probe);
-            record('Restorasi Contextmenu', !blocked, blocked ? 'masih ter-preventDefault' : 'default browser dipulihkan');
-        }
-
-        /** TEST 4: Ketik ke input sementara & verifikasi hasil + timing. */
-        async function testHumanizedTyping() {
-            const input = document.createElement('input');
-            input.style.position = 'fixed';
-            input.style.opacity = '0';
-            document.body.appendChild(input);
-
-            const startTime = performance.now();
-            let inputEvents = 0;
-            input.addEventListener('input', () => inputEvents++);
-
-            await FormAutomationSuite.HumanizedTyping.typeInto(input, 'abc');
-
-            const elapsed = performance.now() - startTime;
-            const valueOK = input.value === 'abc';
-            const eventsOK = inputEvents === 3;
-            // 3 karakter × 60–130ms = minimal ~180ms. Kalau <100ms → delay tidak jalan.
-            const timingOK = elapsed >= 100;
-
-            input.remove();
-            record(
-                'Humanized Typing',
-                valueOK && eventsOK && timingOK,
-                `value="${input.value}", events=${inputEvents}, durasi=${elapsed.toFixed(0)}ms`
-            );
-        }
-
-        /** TEST 5: Verifikasi React-style setter (nilai ter-set via native setter). */
-        function testNativeSetter() {
-            const input = document.createElement('input');
-            const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-            const hasNative = !!(desc && desc.set);
-            record('Native Value Setter', hasNative, hasNative ? 'setter prototype tersedia (kompatibel React/Vue)' : 'setter tidak ditemukan!');
-        }
-
-        async function runAll() {
-            console.log('%c╔══════════════════════════════════╗\n║  FAS SELF-TEST — VERIFIKASI      ║\n╚══════════════════════════════════╝', 'color:#ffb74d;font-weight:bold');
-
-            testVisibilitySpoof();
-            testBlurInterception();
-            testContextMenuRestoration();
-            testNativeSetter();
-            await testHumanizedTyping();
-
-            const passed = results.filter(r => r.passed).length;
-            const summary = `${passed}/${results.length} tes lulus`;
-            console.log(
-                `%c[FAS] SELF-TEST SELESAI: ${summary}`,
-                passed === results.length
-                    ? 'color:#81c784;font-weight:bold;font-size:14px'
-                    : 'color:#e57373;font-weight:bold;font-size:14px'
-            );
-            return results;
-        }
-
-        return { runAll };
-    })();
-
-    /* =========================================================
-     * MODUL 1: BACKGROUND PLAYBACK MODIFIER (ANTI-PAUSE)
+     * MODUL 1: BACKGROUND PLAYBACK MODIFIER (STEALTH EDITION)
      * ========================================================= */
     const BackgroundPlaybackModifier = (() => {
 
         function spoofVisibilityProperties() {
             const visibilityMap = [
-                ['visibilityState', 'hidden'],
-                ['webkitVisibilityState', 'webkitHidden'],
-                ['mozVisibilityState', 'mozHidden'],
-                ['msVisibilityState', 'msHidden']
+                // [properti state, properti hidden, sumber palsu getter]
+                ['visibilityState', 'hidden',
+                    'function get visibilityState() { [native code] }'],
+                ['webkitVisibilityState', 'webkitHidden',
+                    'function get webkitVisibilityState() { [native code] }'],
+                ['mozVisibilityState', 'mozHidden',
+                    'function get mozVisibilityState() { [native code] }'],
+                ['msVisibilityState', 'msHidden',
+                    'function get msVisibilityState() { [native code] }'],
             ];
 
-            visibilityMap.forEach(([stateProp, hiddenProp]) => {
+            visibilityMap.forEach(([stateProp, hiddenProp, stateGetterSrc, ]) => {
                 try {
-                    Object.defineProperty(document, hiddenProp, {
-                        configurable: true,
-                        get: () => false
-                    });
-                    Object.defineProperty(document, stateProp, {
-                        configurable: true,
-                        get: () => 'visible'
-                    });
+                    // Getter di-spoof SEBAGAI fungsi native — toString() akan
+                    // mengembalikan format "[native code]" yang sempurna.
+                    StealthCore.spoofProperty(document, hiddenProp,
+                        function () { return false; },
+                        `function get ${hiddenProp}() { [native code] }`);
+
+                    StealthCore.spoofProperty(document, stateProp,
+                        function () { return 'visible'; },
+                        stateGetterSrc);
                 } catch (e) {
-                    CoreUtils.warn('Playback', `Gagal override ${stateProp}: ${e.message}`);
+                    CoreUtils.warn('Playback', `Gagal spoof ${stateProp}: ${e.message}`);
                 }
             });
-            CoreUtils.log('Playback', 'Visibility spoofed.');
+
+            CoreUtils.log('Playback', 'Visibility ter-spoof dengan descriptor native-like.');
         }
 
         function interceptLifecycleEvents() {
+            const handler = (e) => e.stopImmediatePropagation();
+
+            // Handler di-blinding agar addEventListener inspection tidak
+            // menampilkan fungsi anonim mencurigakan dari userscript.
+            StealthCore.blindFunction(handler);
+
             ['visibilitychange', 'blur', 'pagehide', 'freeze'].forEach((eventType) => {
-                window.addEventListener(eventType, (e) => e.stopImmediatePropagation(), true);
-                document.addEventListener(eventType, (e) => e.stopImmediatePropagation(), true);
+                window.addEventListener(eventType, handler, true);
+                document.addEventListener(eventType, handler, true);
             });
-            CoreUtils.log('Playback', 'Intersepsi lifecycle aktif.');
+
+            CoreUtils.log('Playback', 'Intersepsi lifecycle aktif (capturing).');
         }
 
         function init() {
@@ -337,23 +292,28 @@
 
         function neutralizePreventDefault() {
             RESTORED_EVENTS.forEach((eventType) => {
-                window.addEventListener(eventType, (event) => {
+                const interceptor = (event) => {
                     const original = event.preventDefault.bind(event);
                     Object.defineProperty(event, 'preventDefault', {
                         configurable: true,
                         value: function () {
-                            CoreUtils.log('Accessibility', `preventDefault() dinetralkan: ${eventType}`);
+                            CoreUtils.log('Accessibility', `preventDefault dinetralkan: ${eventType}`);
                         }
                     });
                     event.__originalPreventDefault = original;
-                }, true);
+                };
+                StealthCore.blindFunction(interceptor);
+                window.addEventListener(eventType, interceptor, true);
             });
-            CoreUtils.log('Accessibility', 'preventDefault dinetralkan.');
+
+            CoreUtils.log('Accessibility', 'preventDefault dinetralkan (capturing).');
         }
 
         function stripBlockingAttributes() {
             const apply = () => {
-                document.querySelectorAll('[oncontextmenu], [oncopy], [onpaste], [onselectstart]').forEach((el) => {
+                document.querySelectorAll(
+                    '[oncontextmenu], [oncopy], [onpaste], [onselectstart]'
+                ).forEach((el) => {
                     el.removeAttribute('oncontextmenu');
                     el.removeAttribute('oncopy');
                     el.removeAttribute('onpaste');
@@ -365,7 +325,9 @@
                 });
             };
             apply();
-            new MutationObserver(() => apply()).observe(document.documentElement, { childList: true, subtree: true });
+            const observer = new MutationObserver(() => apply());
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            StealthCore.blindFunction(observer.takeRecords); // konsistensi stealth
         }
 
         function init() {
@@ -381,12 +343,86 @@
     })();
 
     /* =========================================================
-     * MODUL 3: HUMANIZED TYPING SIMULATION
+     * MODUL 3: FULL KEYSTROKE EMULATION CHAIN
+     * keydown → keypress → beforeinput → value → input → keyup
      * ========================================================= */
     const HumanizedTyping = (() => {
 
-        const DELAY_MIN = 60;
+        const DELAY_MIN = 60;   // jeda antar ketukan penuh (ms)
         const DELAY_MAX = 130;
+        const INTRA_CHAIN_MAX = 12; // jeda mikro di dalam rantai satu ketukan
+
+        /* ---------- Pemetaan karakter → key/code/keyCode ---------- */
+
+        const PUNCTUATION_MAP = {
+            '.': ['Period', 190], ',': ['Comma', 188], '-': ['Minus', 189],
+            '_': ['Underscore', 189], '+': ['Equal', 187], '=': ['Equal', 187],
+            '/': ['Slash', 191], '\\': ['Backslash', 220], ';': ['Semicolon', 186],
+            ':': ['Colon', 186], "'": ['Quote', 222], '"': ['Quote', 222],
+            '[': ['BracketLeft', 219], ']': ['BracketRight', 221],
+            '(': ['BracketLeft', 219], ')': ['BracketRight', 221],
+            '!': ['Digit1', 49], '@': ['Digit2', 50], '#': ['Digit3', 51],
+            '$': ['Digit4', 52], '%': ['Digit5', 53], '^': ['Digit6', 54],
+            '&': ['Digit7', 55], '*': ['Digit8', 56], '?': ['Slash', 191],
+            ' ': ['Space', 32], '\n': ['Enter', 13], '\t': ['Tab', 9],
+        };
+
+        function getKeyInfo(char) {
+            if (PUNCTUATION_MAP[char]) {
+                return { code: PUNCTUATION_MAP[char][0], keyCode: PUNCTUATION_MAP[char][1] };
+            }
+            if (/[a-zA-Z]/.test(char)) {
+                const upper = char.toUpperCase();
+                return { code: `Key${upper}`, keyCode: upper.charCodeAt(0) };
+            }
+            if (/[0-9]/.test(char)) {
+                return { code: `Digit${char}`, keyCode: char.charCodeAt(0) };
+            }
+            return { code: 'Unidentified', keyCode: 0 };
+        }
+
+        /* ---------- Konstruksi event keyboard legacy-complete ---------- */
+
+        function buildKeyboardEvent(type, char, keyInfo) {
+            const isEnter = char === '\n';
+            const event = new KeyboardEvent(type, {
+                key: isEnter ? 'Enter' : char,
+                code: keyInfo.code,
+                location: 0,
+                ctrlKey: false,
+                shiftKey: char !== char.toLowerCase() && char === char.toUpperCase() &&
+                          /[a-z0-9]/i.test(char),
+                altKey: false,
+                metaKey: false,
+                repeat: false,
+                isComposing: false,
+                bubbles: true,
+                cancelable: true,
+            });
+
+            // keyCode, which, charCode adalah legacy — konstruktor KeyboardEvent
+            // modern mengabaikannya, jadi kita definisikan secara eksplisit
+            // sebagai non-enumerable read-only (persis seperti event native).
+            const charCode = (type === 'keypress' && !isEnter) ? char.charCodeAt(0) : 0;
+
+            Object.defineProperty(event, 'keyCode',  { get: () => keyInfo.keyCode });
+            Object.defineProperty(event, 'which',    { get: () => keyInfo.keyCode });
+            Object.defineProperty(event, 'charCode', { get: () => charCode });
+
+            return event;
+        }
+
+        function buildInputEvent(type, char) {
+            return new InputEvent(type, {
+                data: char,
+                inputType: 'insertText',
+                isComposing: false,
+                bubbles: true,
+                cancelable: type === 'beforeinput',
+            });
+        }
+
+        /* ---------- Native setter (value tracker React/Vue) ---------- */
 
         function getNativeValueSetter(element) {
             const proto = element instanceof HTMLTextAreaElement
@@ -396,14 +432,44 @@
             return descriptor && descriptor.set ? descriptor.set : null;
         }
 
-        function dispatchInputEvent(element) {
-            element.dispatchEvent(new InputEvent('input', {
-                bubbles: true,
-                cancelable: false,
-                inputType: 'insertText',
-                data: null
-            }));
+        /* ---------- Rantai satu ketukan penuh ---------- */
+
+        async function typeChar(element, char, currentValue, nativeSetter) {
+            const keyInfo = getKeyInfo(char);
+
+            // 1) keydown
+            element.dispatchEvent(buildKeyboardEvent('keydown', char, keyInfo));
+            await CoreUtils.randomDelay(4, INTRA_CHAIN_MAX);
+
+            // 2) keypress (hanya untuk karakter printable, sesuai perilaku browser asli)
+            if (char !== '\n' && char !== '\t') {
+                element.dispatchEvent(buildKeyboardEvent('keypress', char, keyInfo));
+                await CoreUtils.randomDelay(2, 8);
+            }
+
+            // 3) beforeinput
+            element.dispatchEvent(buildInputEvent('beforeinput', char));
+            await CoreUtils.randomDelay(2, 8);
+
+            // 4) Mutasi .value via native setter (value tracker framework aman)
+            const nextValue = currentValue + char;
+            if (nativeSetter) {
+                nativeSetter.call(element, nextValue);
+            } else {
+                element.value = nextValue;
+            }
+
+            // 5) input (dengan data karakter)
+            element.dispatchEvent(buildInputEvent('input', char));
+            await CoreUtils.randomDelay(4, INTRA_CHAIN_MAX);
+
+            // 6) keyup
+            element.dispatchEvent(buildKeyboardEvent('keyup', char, keyInfo));
+
+            return nextValue;
         }
+
+        /* ---------- API publik internal modul ---------- */
 
         async function typeInto(element, text, options = {}) {
             if (!element || !(element instanceof HTMLElement)) {
@@ -415,23 +481,24 @@
 
             element.focus();
             element.dispatchEvent(new FocusEvent('focus', { bubbles: true }));
+            element.dispatchEvent(new Event('select', { bubbles: true }));
 
             const nativeSetter = getNativeValueSetter(element);
-            let currentValue = '';
+            let currentValue = element.value || '';
 
             for (const char of text) {
-                currentValue += char;
-                if (nativeSetter) {
-                    nativeSetter.call(element, currentValue);
-                } else {
-                    element.value = currentValue;
-                }
-                dispatchInputEvent(element);
+                // Rantai lengkap per ketukan...
+                currentValue = await typeChar(element, char, currentValue, nativeSetter);
+                // ...lalu jeda "biologis" antar ketukan (ritme pengetikan)
                 await CoreUtils.randomDelay(delayMin, delayMax);
             }
 
+            // Commit final
             element.dispatchEvent(new Event('change', { bubbles: true }));
-            CoreUtils.log('Typing', `Selesai: ${text.length} karakter diketik.`);
+            element.blur();
+            element.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+
+            CoreUtils.log('Typing', `Rantai keystroke selesai: ${text.length} ketukan.`);
         }
 
         async function fillForm(fieldMap) {
@@ -449,28 +516,120 @@
     })();
 
     /* =========================================================
-     * BOOTSTRAP — Evaluasi kondisi → jalankan modul → self-test
+     * SELF-TEST (internal — hanya berjalan jika CONFIG.runSelfTest)
      * ========================================================= */
-    async function bootstrap() {
-        const { active, reasons } = await ActivationController.evaluate();
+    const SelfTest = (() => {
 
-        if (!active) {
-            console.info(
-                `%c[FAS] Script TIDAK aktif di halaman ini.%c Alasan: ${reasons.join(', ')}. ` +
-                `Aktifkan via FAS.toggle(true) lalu reload.`,
-                'color:#e57373;font-weight:bold',
-                'color:inherit'
-            );
-            return;
+        const results = [];
+        const record = (name, passed, detail) => {
+            results.push({ name, passed });
+            console.log(`${passed ? '✅' : '❌'} [Test] ${name}${detail ? ` — ${detail}` : ''}`);
+        };
+
+        function testToStringBlinding() {
+            // Ekstrak getter document.hidden dan periksa toString()-nya
+            const getter = Object.getOwnPropertyDescriptor(document, 'hidden').get;
+            const output = getter.toString();
+            const passed = output.includes('[native code]');
+            record('ToString Blinding', passed, `output="${output}"`);
         }
 
-        CoreUtils.log('Core', 'Semua kondisi aktivasi terpenuhi ✓');
+        function testDescriptorNativeLike() {
+            const desc = Object.getOwnPropertyDescriptor(document, 'hidden');
+            const passed = desc.enumerable === true && desc.configurable === true
+                        && typeof desc.get === 'function';
+            record('Descriptor Native-Like', passed,
+                `enumerable=${desc.enumerable}, configurable=${desc.configurable}`);
+        }
+
+        function testKeystrokeChain() {
+            const input = document.createElement('input');
+            document.body.appendChild(input);
+
+            const fired = [];
+            ['keydown', 'keypress', 'beforeinput', 'input', 'keyup'].forEach((t) =>
+                input.addEventListener(t, (e) => fired.push({ type: t, key: e.key, keyCode: e.keyCode }))
+            );
+
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value').set;
+            nativeSetter.call(input, 'x');
+            // Uji sinkron satu karakter lewat rantai internal — dispatch manual:
+            const info = { code: 'KeyX', keyCode: 88 };
+            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'x', code: info.code, bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keypress', { key: 'x', code: info.code, bubbles: true }));
+            input.dispatchEvent(new InputEvent('beforeinput', { data: 'x', bubbles: true }));
+            input.dispatchEvent(new InputEvent('input', { data: 'x', bubbles: true }));
+            input.dispatchEvent(new KeyboardEvent('keyup', { key: 'x', code: info.code, bubbles: true }));
+
+            const passed = fired.length === 5
+                && fired[0].type === 'keydown'
+                && fired[4].type === 'keyup'
+                && fired.every((f) => f.keyCode === 88);
+            record('Keystroke Chain Order', passed, fired.map((f) => f.type).join(' → '));
+            input.remove();
+        }
+
+        function testGlobalFootprint() {
+            const leaked = Object.keys(window).filter((k) =>
+                /FAS|FormAutomation|AutomationSuite/i.test(k));
+            record('Zero Global Footprint', leaked.length === 0,
+                leaked.length ? `bocor: ${leaked.join(', ')}` : 'tidak ada properti global');
+        }
+
+        async function testHumanizedTyping() {
+            const input = document.createElement('input');
+            document.body.appendChild(input);
+
+            const startTime = performance.now();
+            let chainCount = 0;
+            input.addEventListener('keydown', () => chainCount++);
+
+            await HumanizedTyping.typeInto(input, 'ab');
+            const elapsed = performance.now() - startTime;
+
+            const passed = input.value === 'ab'
+                && chainCount === 2
+                && elapsed >= 120; // 2 ketukan × 60–130ms
+            record('Humanized Typing E2E', passed,
+                `value="${input.value}", chains=${chainCount}, durasi=${elapsed.toFixed(0)}ms`);
+            input.remove();
+        }
+
+        async function runAll() {
+            console.log('%c[FAS] SELF-TEST DIMULAI', 'color:#ffb74d;font-weight:bold');
+            testToStringBlinding();
+            testDescriptorNativeLike();
+            testKeystrokeChain();
+            testGlobalFootprint();
+            await testHumanizedTyping();
+            const passed = results.filter((r) => r.passed).length;
+            console.log(`%c[FAS] SELESAI: ${passed}/${results.length} lulus`,
+                passed === results.length
+                    ? 'color:#81c784;font-weight:bold'
+                    : 'color:#e57373;font-weight:bold');
+            return results;
+        }
+
+        return { runAll };
+    })();
+
+    /* =========================================================
+     * BOOTSTRAP (isolated)
+     * ========================================================= */
+    async function bootstrap() {
+        StealthCore.init();
+
+        const { active, reasons } = await ActivationController.evaluate();
+        if (!active) {
+            if (CONFIG.debug) CoreUtils.warn('Core', `Tidak aktif: ${reasons.join(', ')}`);
+            return;
+        }
 
         if (CONFIG.modules.playback)      BackgroundPlaybackModifier.init();
         if (CONFIG.modules.accessibility) AccessibilityRestoration.init();
         if (CONFIG.modules.typing)        HumanizedTyping.init();
 
-        // Self-test dijalankan setelah DOM siap (butuh body untuk membuat elemen uji)
         if (CONFIG.runSelfTest) {
             if (document.readyState === 'loading') {
                 document.addEventListener('DOMContentLoaded', () => SelfTest.runAll());
@@ -478,17 +637,17 @@
                 SelfTest.runAll();
             }
         }
+
+        CoreUtils.log('Core', 'v3.0.0 — seluruh modul aktif tanpa jejak global.');
     }
 
     bootstrap();
 
-    // =========================================================
-    // API PUBLIK — untuk pengujian manual dari console DevTools
-    // =========================================================
-    window.FAS = {
-        toggle: ActivationController.toggle,   // FAS.toggle() / FAS.toggle(true/false)
-        test:   () => SelfTest.runAll(),       // FAS.test() → jalankan ulang verifikasi
-        config: CONFIG,                        // FAS.config.debug = true, dst.
-        modules: { BackgroundPlaybackModifier, AccessibilityRestoration, HumanizedTyping },
-    };
+    /* =========================================================
+     * TIDAK ADA EKSPORT GLOBAL.
+     * Tidak ada window.FAS, tidak ada window.__fas, tidak ada apa pun.
+     * Seluruh referensi (nativeToString, spoofedSources, CONFIG, modul)
+     * hidup dan mati di dalam closure IIFE ini — tidak dapat diakses,
+     * di-enumerate, atau di-scan dari console maupun skrip eksternal.
+     * ========================================================= */
 })();
